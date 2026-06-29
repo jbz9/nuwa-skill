@@ -1,0 +1,444 @@
+//@version=5
+indicator("EMA PA - Brooks Pullback", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EMA PA - Brooks Pullback
+// ------------------------------------------------------------------------------
+// 这个脚本不是“自动交易圣杯”。它的定位是：
+// 1. 用均线方向过滤一个基础趋势背景；
+// 2. 等价格回调到信号均线附近；
+// 3. 要求出现质量尚可的信号 K；
+// 4. 再等下一根 K 线收盘确认突破信号 K 高/低点；
+// 5. 画出 Brooks 风格的结构止损：多单用信号 K 低点，空单用信号 K 高点。
+// 6. 根据用户选择画出 1R、2R 或 Measured Move 止盈目标。
+//
+// Brooks 价格行为的核心不是“出现一个点就交易”，而是先判断市场周期：
+// trend / trading range / channel / breakout / reversal attempt。
+// 所以本脚本加入了一个简单的 Market Cycle Filter，用来减少窄交易区间中部的信号。
+// 它仍然只是提醒器，最终交易必须人工结合上下文、关键价位、风险回报判断。
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 1. 均线工具函数
+// ------------------------------------------------------------------------------
+// 允许用户选择 SMA / EMA / WMA / RMA。默认 EMA，因为价格行为交易者常用 EMA
+// 观察回调和动态支撑/阻力，但不要把 EMA 当成独立交易理由。
+// ══════════════════════════════════════════════════════════════════════════════
+f_ma(src, len, type) =>
+    switch type
+        "SMA" => ta.sma(src, len)
+        "EMA" => ta.ema(src, len)
+        "WMA" => ta.wma(src, len)
+        "RMA" => ta.rma(src, len)
+        => ta.ema(src, len)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 2. 参数：回调逻辑
+// ══════════════════════════════════════════════════════════════════════════════
+gr0 = "Pullback Logic"
+pbLookback  = input.int(10, "回调回溯周期", minval=2, group=gr0)
+slopeFilter = input.bool(true, "均线斜率过滤", group=gr0)
+strictPA    = input.bool(true, "严格 K 线质量过滤", group=gr0)
+maxSignals  = input.int(10, "最近显示信号组数", minval=1, group=gr0)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 3. 参数：均线
+// ══════════════════════════════════════════════════════════════════════════════
+gr1 = "Moving Average Settings"
+maType  = input.string("EMA", "MA Type", options=["SMA", "EMA", "WMA", "RMA"], group=gr1)
+emaLen  = input.int(21, "MA 1 (Signal Line)", minval=1, group=gr1)
+emaLen1 = input.int(49, "MA 2 (Trend Line)", minval=1, group=gr1)
+
+ema1 = f_ma(close, emaLen, maType)
+ema2 = f_ma(close, emaLen1, maType)
+plot(ema1, "MA 1 (Signal Line)", color=color.black, linewidth=1)
+plot(ema2, "MA 2 (Trend Line)", color=color.red, linewidth=1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4. 参数：市场周期过滤器 Market Cycle Filter
+// ------------------------------------------------------------------------------
+// 目的：减少“窄交易区间中部”的信号。
+//
+// 为什么要做这个？
+// - EMA 回调信号在趋势里有用；
+// - 但在 trading range 中，价格会反复穿越 EMA，假信号会变多；
+// - 区间中部通常不是 Brooks 风格的好交易位置，因为多空都没有清晰优势。
+//
+// 本过滤器包含两个部分：
+// A. EMA 分离度过滤：两条均线距离太近，说明趋势背景不清晰；
+// B. 窄区间中部过滤：最近 N 根的区间高度太小，且价格在区间中部，跳过信号。
+// ══════════════════════════════════════════════════════════════════════════════
+grMC = "Market Cycle Filter"
+useMarketCycleFilter = input.bool(true, "启用市场周期过滤", group=grMC)
+atrLen      = input.int(14, "ATR Length", minval=1, group=grMC)
+minSepAtr   = input.float(0.15, "最小均线分离度 ATR 倍数", minval=0.0, step=0.05, group=grMC)
+rangeLen    = input.int(20, "交易区间检测周期", minval=5, group=grMC)
+minRangeAtr = input.float(1.20, "最小区间高度 ATR 倍数", minval=0.1, step=0.1, group=grMC)
+midLow      = input.float(0.35, "区间中部下界", minval=0.0, maxval=1.0, step=0.05, group=grMC)
+midHigh     = input.float(0.65, "区间中部上界", minval=0.0, maxval=1.0, step=0.05, group=grMC)
+showContext = input.bool(true, "显示 Market Context", group=grMC)
+
+atr = ta.atr(atrLen)
+emaSpreadOk = math.abs(ema1 - ema2) > atr * minSepAtr
+
+recentHigh = ta.highest(high, rangeLen)
+recentLow  = ta.lowest(low, rangeLen)
+recentRange = recentHigh - recentLow
+rangeWideEnough = recentRange > atr * minRangeAtr
+
+// pricePosInRange 越接近 0 越靠近最近区间下沿，越接近 1 越靠近上沿。
+// 如果区间很窄，且价格在 0.35~0.65 中部，就跳过信号。
+pricePosInRange = recentRange > 0 ? (close - recentLow) / recentRange : 0.5
+isRangeMiddle = pricePosInRange >= midLow and pricePosInRange <= midHigh
+avoidNarrowMiddle = not (not rangeWideEnough and isRangeMiddle)
+
+marketCycleOk = useMarketCycleFilter ? (emaSpreadOk and avoidNarrowMiddle) : true
+marketState = not useMarketCycleFilter ? "Filter OFF" : not emaSpreadOk ? "EMA Chop / TR Risk" : not avoidNarrowMiddle ? "Narrow TR Middle" : "Trend/Pullback Context"
+
+// 右上角提示当前过滤器状态，帮助你先看上下文，而不是只盯买卖点。
+var table contextTable = table.new(position.top_right, 1, 1)
+if showContext and barstate.islast
+    table.cell(contextTable, 0, 0, marketState, text_color=color.white, bgcolor=marketCycleOk ? color.new(color.green, 30) : color.new(color.red, 30))
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5. K 线基础数据
+// ══════════════════════════════════════════════════════════════════════════════
+barRange  = high - low
+bodySize  = math.abs(close - open)
+upperTail = high - math.max(close, open)
+lowerTail = math.min(close, open) - low
+midPoint  = (high + low) / 2
+
+// 避免极小 range K 线导致比例判断失真。
+validRange = barRange > syminfo.mintick
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 6. 信号 K 质量过滤
+// ------------------------------------------------------------------------------
+// 这只是机械化的“信号 K 质量”近似，不等于完整 Brooks PA 判断。
+// 多头信号 K：实体足够大、收盘在 K 线中点上方、上影线不能过长。
+// 空头信号 K：实体足够大、收盘在 K 线中点下方、下影线不能过长。
+// ══════════════════════════════════════════════════════════════════════════════
+qualityBullSignal = validRange and bodySize > barRange * 0.5 and upperTail < bodySize and close > midPoint
+qualityBearSignal = validRange and bodySize > barRange * 0.5 and lowerTail < bodySize and close < midPoint
+
+isBullSignalBar = strictPA ? (close > open and qualityBullSignal) : (close > open)
+isBearSignalBar = strictPA ? (close < open and qualityBearSignal) : (close < open)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 7. 入场 K 质量过滤
+// ------------------------------------------------------------------------------
+// 入场 K 比信号 K 稍微放宽：实体超过 40% range 即可。
+// 目的：确认下一根 K 线确实向信号方向突破，而不是只刺破后收回。
+// ══════════════════════════════════════════════════════════════════════════════
+qualityBullEntry = validRange and bodySize > barRange * 0.4 and upperTail < bodySize * 1.5 and close > midPoint
+qualityBearEntry = validRange and bodySize > barRange * 0.4 and lowerTail < bodySize * 1.5 and close < midPoint
+
+isBullEntry = strictPA ? (close > open and qualityBullEntry) : (close > open)
+isBearEntry = strictPA ? (close < open and qualityBearEntry) : (close < open)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 8. 趋势与回调确认
+// ------------------------------------------------------------------------------
+// 旧写法通常用 ta.lowest(low, pbLookback) < 当前 ema1。
+// 这会把“过去 N 根最低价”拿来和“当前 EMA”比较，EMA 快速移动时会有失真。
+//
+// 新写法：用 ta.barssince(low <= ema1) 判断过去 N 根里是否真实触碰/跌破过当时 EMA。
+// 多头：过去 N 根内价格曾经回调到 ema1 下方或触碰 ema1；当前重新收回 ema1 上方。
+// 空头：过去 N 根内价格曾经反弹到 ema1 上方或触碰 ema1；当前重新收回 ema1 下方。
+// ══════════════════════════════════════════════════════════════════════════════
+emaUp   = slopeFilter ? ema1 > ema1[1] : true
+emaDown = slopeFilter ? ema1 < ema1[1] : true
+
+barsSinceBelow = ta.barssince(low <= ema1)
+barsSinceAbove = ta.barssince(high >= ema1)
+wasBelow = not na(barsSinceBelow) and barsSinceBelow <= pbLookback
+wasAbove = not na(barsSinceAbove) and barsSinceAbove <= pbLookback
+
+emaInteractionBuy  = low <= ema1 and close > ema1
+emaInteractionSell = high >= ema1 and close < ema1
+
+isSignalBarBuy  = marketCycleOk and (ema1 > ema2) and emaUp and wasBelow and emaInteractionBuy and isBullSignalBar
+isSignalBarSell = marketCycleOk and (ema1 < ema2) and emaDown and wasAbove and emaInteractionSell and isBearSignalBar
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 9. 入场信号：收盘确认 + barstate.isconfirmed
+// ------------------------------------------------------------------------------
+// barstate.isconfirmed 只在当前 K 线确认收盘后为 true。
+// 这样可以避免实时 K 线盘中突破、盘中回落导致信号抖动。
+//
+// 这里采用“收盘确认”版本：
+// 多头：上一根是多头信号 K，当前 K 收盘突破上一根高点，且当前 K 也有质量；
+// 空头：上一根是空头信号 K，当前 K 收盘跌破上一根低点，且当前 K 也有质量。
+//
+// 如果你想更接近传统 stop entry，可把 close > high[1] 改为 high > high[1]，
+// 但那会更容易出现盘中假突破。
+// ══════════════════════════════════════════════════════════════════════════════
+confirmed = barstate.isconfirmed
+buySignal  = confirmed and isSignalBarBuy[1] and close > high[1] and isBullEntry
+sellSignal = confirmed and isSignalBarSell[1] and close < low[1] and isBearEntry
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 10. Brooks 风格止损逻辑：去掉缓冲，直接使用高低点
+// ------------------------------------------------------------------------------
+// 按用户要求：移除止损缓冲参数。
+// 默认多头止损 = 信号 K 低点；默认空头止损 = 信号 K 高点。
+//
+// 为了更 Brooks 一点，提供三种结构止损模式：
+// 1. Signal Bar：信号 K 外侧，最贴近 Brooks stop-entry 基础训练；
+// 2. Entry Bar：入场 K 外侧，更紧，但更容易被噪音扫；
+// 3. Swing Pivot：最近 N 根 swing 高/低点外侧，更宽，仓位必须更小。
+//
+// 注意：这里没有加任何 buffer。实际交易中需要考虑点差、滑点和品种最小跳动。
+// ══════════════════════════════════════════════════════════════════════════════
+grSL = "Stop Loss"
+stopMode = input.string("Signal Bar", "Stop Mode", options=["Signal Bar", "Entry Bar", "Swing Pivot"], group=grSL)
+swingStopLookback = input.int(5, "Swing Pivot Lookback", minval=2, group=grSL)
+
+// 止盈不是“预测市场必到哪里”，而是交易者方程的一部分：
+// - 1R Scalp：目标近，通常胜率更高，但单笔回报较小；
+// - 2R Swing：用 2:1 风险回报换取更少但更有价值的波段机会；
+// - Measured Move：假设市场有惯性，用最近一段运动向前投射，适合强趋势/突破，不适合窄区间中部。
+grTP = "Take Profit"
+showTP = input.bool(true, "显示止盈目标", group=grTP)
+showOnlyActivePlan = input.bool(true, "只显示当前活跃计划", group=grTP)
+targetMode = input.string("2R Swing", "止盈模式", options=["1R Scalp", "2R Swing", "Measured Move"], group=grTP)
+rrMultiple = input.float(2.0, "2R Swing 倍数", minval=0.25, step=0.25, group=grTP)
+scalpMultiple = input.float(1.0, "1R Scalp 倍数", minval=0.25, step=0.25, group=grTP)
+mmLookback = input.int(20, "Measured Move 回溯周期", minval=5, group=grTP)
+
+// ta.lowest / ta.highest 每根 K 线都先计算，避免只在信号触发时才调用导致历史序列不一致。
+swingBuyStop = ta.lowest(low, swingStopLookback)
+swingSellStop = ta.highest(high, swingStopLookback)
+
+// Measured Move 是一种“惯性目标”：用最近一段可见波幅作为第一段运动，向入场方向投射。
+// 它更适合趋势、突破、清晰通道；在交易区间中部容易过度乐观。
+mmHigh = ta.highest(high, mmLookback)
+mmLow = ta.lowest(low, mmLookback)
+mmRange = mmHigh - mmLow
+
+f_buyStop() =>
+    switch stopMode
+        "Signal Bar" => low[1]
+        "Entry Bar" => low
+        "Swing Pivot" => swingBuyStop
+        => low[1]
+
+f_sellStop() =>
+    switch stopMode
+        "Signal Bar" => high[1]
+        "Entry Bar" => high
+        "Swing Pivot" => swingSellStop
+        => high[1]
+
+f_buyTarget(entryPrice, stopPrice) =>
+    risk = entryPrice - stopPrice
+    risk <= syminfo.mintick ? na :
+      targetMode == "1R Scalp" ? entryPrice + risk * scalpMultiple :
+      targetMode == "2R Swing" ? entryPrice + risk * rrMultiple :
+      entryPrice + mmRange
+
+f_sellTarget(entryPrice, stopPrice) =>
+    risk = stopPrice - entryPrice
+    risk <= syminfo.mintick ? na :
+      targetMode == "1R Scalp" ? entryPrice - risk * scalpMultiple :
+      targetMode == "2R Swing" ? entryPrice - risk * rrMultiple :
+      entryPrice - mmRange
+
+var float activeBuySL = na
+var float activeSellSL = na
+var float activeBuyTP = na
+var float activeSellTP = na
+var int activeBuySLBar = na
+var int activeSellSLBar = na
+var line buySLLine = na
+var line sellSLLine = na
+var line buyTPLine = na
+var line sellTPLine = na
+var label activeStopLabel = na
+var label activeTPLabel = na
+
+// 当只想看当前活跃计划时，新信号出现前先删除旧的 Stop / TP 线和文字，避免图上同时出现多个 TP。
+// 如果你想保留历史信号复盘，可以关闭“只显示当前活跃计划”。
+f_deleteActivePlanLines() =>
+    if not na(buySLLine)
+        line.delete(buySLLine)
+    if not na(buyTPLine)
+        line.delete(buyTPLine)
+    if not na(sellSLLine)
+        line.delete(sellSLLine)
+    if not na(sellTPLine)
+        line.delete(sellTPLine)
+    if not na(activeStopLabel)
+        label.delete(activeStopLabel)
+    if not na(activeTPLabel)
+        label.delete(activeTPLabel)
+
+if buySignal
+    if showOnlyActivePlan
+        f_deleteActivePlanLines()
+        activeStopLabel := na
+        activeTPLabel := na
+    activeBuySL := f_buyStop()
+    activeBuyTP := f_buyTarget(close, activeBuySL)
+    activeBuySLBar := bar_index
+    activeSellSL := na
+    activeSellTP := na
+    activeSellSLBar := na
+    buySLLine := line.new(bar_index, activeBuySL, bar_index + 1, activeBuySL, color=color.red, width=1)
+    buyTPLine := showTP and not na(activeBuyTP) ? line.new(bar_index, activeBuyTP, bar_index + 1, activeBuyTP, color=color.green, width=1, style=line.style_dashed) : na
+
+if sellSignal
+    if showOnlyActivePlan
+        f_deleteActivePlanLines()
+        activeStopLabel := na
+        activeTPLabel := na
+    activeSellSL := f_sellStop()
+    activeSellTP := f_sellTarget(close, activeSellSL)
+    activeSellSLBar := bar_index
+    activeBuySL := na
+    activeBuyTP := na
+    activeBuySLBar := na
+    sellSLLine := line.new(bar_index, activeSellSL, bar_index + 1, activeSellSL, color=color.red, width=1)
+    sellTPLine := showTP and not na(activeSellTP) ? line.new(bar_index, activeSellTP, bar_index + 1, activeSellTP, color=color.green, width=1, style=line.style_dashed) : na
+
+// 只延长当前有效止损线。
+if not na(activeBuySL) and not na(buySLLine)
+    line.set_x2(buySLLine, bar_index)
+if not na(activeSellSL) and not na(sellSLLine)
+    line.set_x2(sellSLLine, bar_index)
+if not na(activeBuyTP) and not na(buyTPLine)
+    line.set_x2(buyTPLine, bar_index)
+if not na(activeSellTP) and not na(sellTPLine)
+    line.set_x2(sellTPLine, bar_index)
+
+// 如果价格触碰/突破止损或止盈，则清空对应 active plan。
+// 注意：止损检查从信号后一根 K 线开始。
+// 原因：Entry Bar 模式下，多头止损等于当前 K 低点、空头止损等于当前 K 高点；
+// 如果在信号同一根 K 线立刻检查，会因为 low <= low 或 high >= high 而马上清空止损。
+buyStopCanTrigger = not na(activeBuySLBar) and bar_index > activeBuySLBar
+sellStopCanTrigger = not na(activeSellSLBar) and bar_index > activeSellSLBar
+
+buyTargetCanTrigger = not na(activeBuySLBar) and bar_index > activeBuySLBar
+sellTargetCanTrigger = not na(activeSellSLBar) and bar_index > activeSellSLBar
+
+if buyStopCanTrigger and not na(activeBuySL) and low <= activeBuySL
+    if showOnlyActivePlan
+        f_deleteActivePlanLines()
+    activeBuySL := na
+    activeBuyTP := na
+    activeBuySLBar := na
+    buySLLine := na
+    buyTPLine := na
+    activeStopLabel := na
+    activeTPLabel := na
+if sellStopCanTrigger and not na(activeSellSL) and high >= activeSellSL
+    if showOnlyActivePlan
+        f_deleteActivePlanLines()
+    activeSellSL := na
+    activeSellTP := na
+    activeSellSLBar := na
+    sellSLLine := na
+    sellTPLine := na
+    activeStopLabel := na
+    activeTPLabel := na
+if buyTargetCanTrigger and not na(activeBuyTP) and high >= activeBuyTP
+    if showOnlyActivePlan
+        f_deleteActivePlanLines()
+    activeBuySL := na
+    activeBuyTP := na
+    activeBuySLBar := na
+    buySLLine := na
+    buyTPLine := na
+    activeStopLabel := na
+    activeTPLabel := na
+if sellTargetCanTrigger and not na(activeSellTP) and low <= activeSellTP
+    if showOnlyActivePlan
+        f_deleteActivePlanLines()
+    activeSellSL := na
+    activeSellTP := na
+    activeSellSLBar := na
+    sellSLLine := na
+    sellTPLine := na
+    activeStopLabel := na
+    activeTPLabel := na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 11. 绘图样式
+// ══════════════════════════════════════════════════════════════════════════════
+grStyle = "Signal Styling"
+shapeOpt = input.string("圆形", "信号形状", options=["圆形", "正方形", "菱形", "十字"], group=grStyle)
+sizeOpt = input.string("小", "图形大小", options=["小", "中", "大", "巨大"], group=grStyle)
+bullCol = input.color(color.green, "Buy Color", group=grStyle)
+bearCol = input.color(color.red, "Sell Color", group=grStyle)
+
+get_char(opt) =>
+    switch opt
+        "圆形" => "●"
+        "正方形" => "■"
+        "菱形" => "◆"
+        "十字" => "✚"
+        => "●"
+
+get_size(opt) =>
+    switch opt
+        "小" => size.small
+        "中" => size.normal
+        "大" => size.large
+        "巨大" => size.huge
+        => size.small
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 12. 对象数组管理
+// ------------------------------------------------------------------------------
+// TradingView 对 label / line 数量有限制。这里保留最近 maxSignals 组，避免图表变慢。
+// 每个信号最多创建：1 个信号 label + 1 个 Stop label + 1 个 TP label + 1 条 stop line + 1 条 target line。
+// ══════════════════════════════════════════════════════════════════════════════
+var label[] allLabels = array.new_label()
+var line[] allLines = array.new_line()
+
+f_addLabel(lbl) =>
+    array.push(allLabels, lbl)
+    if array.size(allLabels) > maxSignals * 4
+        label.delete(array.shift(allLabels))
+
+f_addLine(ln) =>
+    array.push(allLines, ln)
+    if array.size(allLines) > maxSignals * 3
+        line.delete(array.shift(allLines))
+
+if buySignal
+    f_addLabel(label.new(bar_index, low, get_char(shapeOpt), style=label.style_none, textcolor=bullCol, size=get_size(sizeOpt), yloc=yloc.price))
+    if showOnlyActivePlan
+        activeStopLabel := label.new(bar_index, activeBuySL, "Stop", style=label.style_none, textcolor=color.red, size=size.small, yloc=yloc.price)
+        activeTPLabel := showTP and not na(activeBuyTP) ? label.new(bar_index, activeBuyTP, "TP", style=label.style_none, textcolor=color.green, size=size.small, yloc=yloc.price) : na
+    else
+        f_addLabel(label.new(bar_index, activeBuySL, "Stop", style=label.style_none, textcolor=color.red, size=size.small, yloc=yloc.price))
+        if showTP and not na(activeBuyTP)
+            f_addLabel(label.new(bar_index, activeBuyTP, "TP", style=label.style_none, textcolor=color.green, size=size.small, yloc=yloc.price))
+        f_addLine(buySLLine)
+        if showTP and not na(buyTPLine)
+            f_addLine(buyTPLine)
+
+if sellSignal
+    f_addLabel(label.new(bar_index, high, get_char(shapeOpt), style=label.style_none, textcolor=bearCol, size=get_size(sizeOpt), yloc=yloc.price))
+    if showOnlyActivePlan
+        activeStopLabel := label.new(bar_index, activeSellSL, "Stop", style=label.style_none, textcolor=color.red, size=size.small, yloc=yloc.price)
+        activeTPLabel := showTP and not na(activeSellTP) ? label.new(bar_index, activeSellTP, "TP", style=label.style_none, textcolor=color.green, size=size.small, yloc=yloc.price) : na
+    else
+        f_addLabel(label.new(bar_index, activeSellSL, "Stop", style=label.style_none, textcolor=color.red, size=size.small, yloc=yloc.price))
+        if showTP and not na(activeSellTP)
+            f_addLabel(label.new(bar_index, activeSellTP, "TP", style=label.style_none, textcolor=color.green, size=size.small, yloc=yloc.price))
+        f_addLine(sellSLLine)
+        if showTP and not na(sellTPLine)
+            f_addLine(sellTPLine)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 13. Alerts
+// ------------------------------------------------------------------------------
+// 用户要求采用 “Brooks PA Buy/Sell” 命名。
+// 但请记住：这只是一个 EMA pullback + price action quality 的实现，
+// 不代表完整 Brooks 判断。警报出现后，仍要人工判断市场周期、关键价位和风险回报。
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(buySignal, "Brooks PA Buy", "Brooks PA Buy")
+alertcondition(sellSignal, "Brooks PA Sell", "Brooks PA Sell")
